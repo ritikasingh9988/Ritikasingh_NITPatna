@@ -1,7 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pillow
 pytesseract
-requests
-python-dotenv
-openai
+pdf2image
+pdfplumber
+numpy
+opencv-python-headless
+python-multipart
+regex
