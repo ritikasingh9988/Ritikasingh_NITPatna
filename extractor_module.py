@@ -1,191 +1,141 @@
+# extractor_module.py
 import re
-from typing import List, Dict, Tuple
-import pdfplumber
+from typing import List, Dict, Tuple, Optional
 
-# Heuristic helper regexes
-AMOUNT_RE = re.compile(r'([0-9]+(?:[,][0-9]{3})*(?:\.[0-9]{1,2})?)\b')
-QUANTITY_RE = re.compile(r'(?:x|qty|qty:|quantity|no\.)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)', re.I)
-SNO_PREFIX_RE = re.compile(r'^\s*\d+[\)\.\-]?\s*')  # remove leading numbering "1.", "2) ", etc.
-TOTAL_LABELS = [
-    r'grand\s*total', r'net\s*amount\s*payable', r'net\s*amount', r'total\s*amount',
-    r'total\s*bill', r'final\s*total', r'total\s*of\s*pharmacy', r'total'
-]
-TOTAL_RE_LIST = [re.compile(rf'({label})\s*[:\-]?\s*([0-9]+(?:[,][0-9]{{3}})*(?:\.[0-9]+)?)', re.I) for label in TOTAL_LABELS]
+AMOUNT_RE = re.compile(r'([0-9]+(?:[,\s][0-9]{3})*(?:\.\d+)?)')  # matches amounts with commas or decimals
+# common separators used often in invoices between name and amounts
+LINE_SPLIT_RE = re.compile(r'\s{2,}|\t|\s*\|\s*')  # multiple spaces or pipe separators
 
-def clean_text(t: str) -> str:
-    if t is None:
-        return ""
-    # normalise whitespace and remove weird non-printables
-    return re.sub(r'\s+', ' ', t).strip()
-
-def extract_text_pages_pdfplumber(pdf_bytes: bytes) -> List[str]:
-    pages_text = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            pages_text.append(clean_text(txt))
-    return pages_text
-
-# fallback minimal OCR approach (if needed) is omitted for brevity.
-# We prefer pdfplumber for this datathon sample.
-
-import io
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
-    # try pdfplumber first
+def parse_amount(text: str) -> Optional[float]:
+    """
+    Parse first numeric amount-like token in text and return float (commas removed).
+    """
+    if text is None:
+        return None
+    m = AMOUNT_RE.search(text.replace('₹', '').replace('INR', ''))
+    if not m:
+        return None
+    num = m.group(1)
+    num = num.replace(' ', '').replace(',', '')
     try:
-        return extract_text_pages_pdfplumber(pdf_bytes)
+        return float(num)
     except Exception:
-        # fallback: return single block to avoid crash
-        return [clean_text(pdf_bytes.decode('latin-1', errors='ignore'))]
+        return None
 
-def parse_items_from_page_text(page_text: str) -> List[Dict]:
+def parse_line_item(line: str) -> Dict:
+    """
+    Try to parse an item line and return dict with keys: item_name, item_amount, item_rate, item_quantity, raw
+    Heuristics:
+      - Look for last amount tokens as item amounts/rates.
+      - If only one number found -> treat as amount.
+      - If multiple numbers found, treat last as amount, previous maybe rate/qty.
+    """
+    raw = line.strip()
+    # split by long spaces or pipes if present to separate columns
+    parts = LINE_SPLIT_RE.split(raw)
+    # if parted into columns and last column contains numbers -> use that
+    if len(parts) >= 2:
+        # try from last column backwards to find an amount
+        for i in range(len(parts)-1, 0, -1):
+            amt = parse_amount(parts[i])
+            if amt is not None:
+                # name = join of columns before this one
+                name = ' '.join(parts[:i]).strip()
+                # attempt to find rate/quantity on the right side as extra numbers
+                right_nums = AMOUNT_RE.findall(' '.join(parts[i:]))
+                rate = None
+                qty = 1
+                if len(right_nums) >= 2:
+                    # assume second last is rate, last is amount OR last is amount and earlier could be qty
+                    try:
+                        rate = float(right_nums[-2].replace(',','').replace(' ',''))
+                    except:
+                        rate = None
+                return {
+                    "item_name": name if name else raw,
+                    "item_amount": float(amt),
+                    "item_rate": float(rate) if rate is not None else 0.0,
+                    "item_quantity": 1,
+                    "raw": raw
+                }
+    # fallback: search all numeric tokens
+    all_nums = AMOUNT_RE.findall(raw)
+    if all_nums:
+        # treat last as amount
+        amt = all_nums[-1]
+        try:
+            amount_val = float(amt.replace(',','').replace(' ', ''))
+        except:
+            amount_val = 0.0
+        # name = line without the last matched numeric token
+        # remove last occurrence of matched string
+        idx = raw.rfind(all_nums[-1])
+        name = raw[:idx].strip() if idx!=-1 else raw
+        return {
+            "item_name": name if name else raw,
+            "item_amount": amount_val,
+            "item_rate": 0.0,
+            "item_quantity": 1,
+            "raw": raw
+        }
+    # no number found at all -> treat as description (amount 0)
+    return {
+        "item_name": raw,
+        "item_amount": 0.0,
+        "item_rate": 0.0,
+        "item_quantity": 1,
+        "raw": raw
+    }
+
+def find_items_from_page_text(page_text: str) -> List[Dict]:
+    """
+    Given a page text, split into lines and attempt to parse line items.
+    This uses heuristics: only lines with at least one numeric token are considered
+    likely line-items; also try to skip header lines (containing 'bill', 'invoice', 'patient') heuristically.
+    """
     items = []
     if not page_text:
         return items
-
-    # split text by newlines or by common separators if pages come as single line
-    lines = re.split(r'\n|;|\r', page_text)
-    if len(lines) == 1:
-        # if page text is single line long string, try splitting by double spaces which often separate fields
-        lines = re.split(r'\s{2,}', page_text)
-
-    for raw in lines:
-        t = clean_text(raw)
-        if not t:
-            continue
-
-        # Skip lines that are likely header/footer
-        low = t.lower()
-        if any(x in low for x in ('invoice', 'bill', 'patient name', 'hospital', 'reg no', 'address', 'total', 'grand')):
-            # still process lines that might be "Total ..." later in totals function
-            # but skip full headers (heuristic)
-            pass
-
-        # find amounts in line (we pick the last numeric-looking token as item amount)
-        amounts = AMOUNT_RE.findall(t)
-        if not amounts:
-            continue  # likely not a line-item if it has no number
-
-        amount_str = amounts[-1]
-        # convert to float safely
-        amount_val = float(amount_str.replace(',', ''))
-
-        # quantity detection
-        qmatch = QUANTITY_RE.search(t)
-        if qmatch:
-            try:
-                quantity_val = float(qmatch.group(1))
-            except:
-                quantity_val = 1.0
-        else:
-            # Try to detect patterns like "2 x" or "2x"
-            m = re.search(r'(\d+(?:\.\d+)?)\s*[xX]\b', t)
-            if m:
-                quantity_val = float(m.group(1))
-            else:
-                quantity_val = 1.0
-
-        # compute rate if possible (if qty>0 and amount looks like total)
-        rate_val = 0.0
-        if quantity_val and quantity_val != 0:
-            # if there's a separate number before amount that looks like per-unit, we could derive, but to be safe:
-            # we set rate == amount/quantity if amount was full line amount
-            try:
-                rate_val = round(amount_val / quantity_val, 2)
-            except Exception:
-                rate_val = 0.0
-
-        # build name: remove amount and qty tokens and leading sno
-        name = SNO_PREFIX_RE.sub('', t)
-        # remove the amount token at end
-        name = re.sub(re.escape(amount_str) + r'\s*$', '', name).strip()
-        # remove quantity mentions
-        name = re.sub(r'\b(x|qty|qty:|quantity|no\.)\b.*$', '', name, flags=re.I).strip()
-        # further cleanup
-        name = re.sub(r'[\:\-\*]{2,}', ' ', name).strip()
-
-        if not name:
-            # fallback to something sensible
-            name = f"item_{len(items)+1}"
-
-        # remove excessive trailing punctuation
-        name = name.strip(' ,:-.')
-
-        items.append({
-            "item_name": name,
-            "item_amount": round(amount_val, 2),
-            "item_rate": round(rate_val, 2) if rate_val else 0.0,
-            "item_quantity": int(quantity_val) if float(quantity_val).is_integer() else quantity_val,
-            "raw": t
-        })
+    lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+    for line in lines:
+        low = line.lower()
+        # skip header-like lines
+        if any(h in low for h in ('bill', 'invoice', 'patient name', 'reg no', 'age/sex', 'date', 'page')):
+            # but sometimes headers contain amounts — we skip only pure header like lines
+            # keep only if there is an amount token
+            if not AMOUNT_RE.search(line):
+                continue
+        # heuristics: consider as line item if at least one number present OR pattern like ITEM NAME + amount
+        if AMOUNT_RE.search(line):
+            parsed = parse_line_item(line)
+            # skip lines where the parsed name is obviously the header
+            if parsed and parsed.get('item_name'):
+                items.append(parsed)
     return items
 
-def find_totals_and_reconcile(page_texts: List[str], items_all_pages: List[Dict]) -> Tuple[float, float]:
-    grand_total = None
-    # search across pages bottom-up for typical total labels
-    combined_text = "\n".join(page_texts)
-    for regex in TOTAL_RE_LIST:
-        m = regex.search(combined_text[::-1])  # trick: search reversed? easier is search last occurrence.
-        # but reversed regex is tricky; instead find last match
-        all_matches = list(regex.finditer(combined_text))
-        if all_matches:
-            last = all_matches[-1]
-            try:
-                val = float(last.group(2).replace(',', ''))
-                grand_total = round(val, 2)
-                break
-            except Exception:
-                continue
-
-    # if not found, try more generic last-number-labelled-line containing 'total' word
-    if grand_total is None:
-        for p in reversed(page_texts):
-            for line in reversed(p.splitlines()):
-                if 'total' in line.lower() or 'grand' in line.lower() or 'net amount' in line.lower() or 'final total' in line.lower():
-                    m = AMOUNT_RE.search(line)
-                    if m:
-                        try:
-                            grand_total = float(m.group(1).replace(',', ''))
-                            break
-                        except:
-                            pass
-            if grand_total is not None:
-                break
-
-    # compute sum extracted
-    total_extracted = sum([i.get('item_amount', 0.0) for i in items_all_pages])
-    total_extracted = round(total_extracted, 2)
-
-    if grand_total is None:
-        reconciled = 0.0
-        grand_total = 0.0
-    else:
-        reconciled = round(grand_total - total_extracted, 2)
-
-    return grand_total, reconciled
-
-def run_full_extraction(pdf_bytes: bytes) -> Dict:
-    pages = extract_text_from_pdf_bytes(pdf_bytes)
-    pagewise_line_items = []
-    all_items_flat = []
-    for idx, ptxt in enumerate(pages):
-        items = parse_items_from_page_text(ptxt)
-        pagewise_line_items.append({
-            "page_no": idx + 1,  # 1-indexed
-            "page_type": "Bill Detail",
-            "bill_items": items
-        })
-        all_items_flat.extend(items)
-
-    grand, reconciled = find_totals_and_reconcile(pages, all_items_flat)
-
-    response = {
-        "is_success": True,
-        "data": {
-            "pagewise_line_items": pagewise_line_items,
-            "total_item_count": sum(len(p["bill_items"]) for p in pagewise_line_items),
-            "reconciled_amount": reconciled,
-            "grand_total_found": grand
-        }
-    }
-    return response
+def find_totals_and_reconcile(page_texts: List[str]) -> Tuple[Optional[float], float]:
+    """
+    Look for a grand total in pages (search for keywords 'grand total', 'net amount', 'net payable', 'total').
+    Returns (grand_total_found_or_None, reconciled_amount=grand - sum(items) if grand exists else 0)
+    """
+    grand = None
+    # search from last page backwards for totals
+    key_patterns = [
+        r'grand total[:\s]*([0-9,.\s]+)',
+        r'net amount payable[:\s]*([0-9,.\s]+)',
+        r'net payable[:\s]*([0-9,.\s]+)',
+        r'grand total found[:\s]*([0-9,.\s]+)',
+        r'\btotal of\b[:\s]*([0-9,.\s]+)',
+        r'total[:\s]*([0-9,.\s]+)$'
+    ]
+    for t in reversed(page_texts):
+        lower = t.lower()
+        for pat in key_patterns:
+            m = re.search(pat, lower, flags=re.IGNORECASE)
+            if m:
+                val_text = m.group(1)
+                val = parse_amount(val_text)
+                if val is not None:
+                    grand = val
+                    return grand, 0.0  # reconciliation will be computed outside once items sum known
+    return None, 0.0
