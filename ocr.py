@@ -1,46 +1,60 @@
 # ocr.py
 import io
-import os
-from PIL import Image, ImageFilter, ImageOps
-import numpy as np
-import pytesseract
+import pdfplumber
 from pdf2image import convert_from_bytes
+import pytesseract
+import re
 
-# If Windows, set your tesseract path here (uncomment & edit if needed)
+# If tesseract is not in PATH on Windows, set path:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-def preprocess_pil_image(img: Image.Image) -> Image.Image:
-    """Basic preprocessing to improve OCR: grayscale, autocontrast, median filter, threshold."""
-    img = img.convert("L")
-    img = ImageOps.autocontrast(img, cutoff=1)
-    img = img.filter(ImageFilter.MedianFilter(size=3))
-    # simple threshold - tuned for receipts
-    img = img.point(lambda p: 255 if p > 170 else 0)
-    return img
+def clean_text(t: str) -> str:
+    if t is None:
+        return ""
+    # normalize spaces and weird unicode
+    t = t.replace('\r', '\n')
+    t = re.sub(r'\n\s+\n', '\n', t)
+    t = re.sub(r'[ \t]+', ' ', t)
+    t = t.strip()
+    return t
 
-def ocr_image_bytes(img_bytes: bytes, tesseract_config: str = "--psm 6") -> str:
-    """OCR one image from bytes using pytesseract."""
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    pre = preprocess_pil_image(img)
-    text = pytesseract.image_to_string(pre, lang="eng", config=tesseract_config)
-    return text
-
-def pdf_bytes_to_pages_text(content: bytes, dpi: int = 300):
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = 200) -> list:
     """
-    Try to extract text from PDF pages:
-     - First try pdfplumber (in user code path; that is used in extractor)
-     - If calling this fallback directly, rasterize pages with pdf2image and OCR them.
+    Return list of page texts (page index 0 -> page 1). If pdfplumber returns empty,
+    fallback to image OCR for those pages.
     """
-    # Convert to images (pdf2image); use POPPLER_PATH env var if set
-    poppler_path = os.environ.get("POPPLER_PATH", None)
-    if poppler_path:
-        images = convert_from_bytes(content, dpi=dpi, poppler_path=poppler_path)
-    else:
-        images = convert_from_bytes(content, dpi=dpi)
     pages_text = []
-    for img in images:
-        # convert PIL image to bytes for OCR helper
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        pages_text.append(ocr_image_bytes(buf.getvalue()))
-    return pages_text
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                pages_text.append(clean_text(text))
+    except Exception:
+        # if pdfplumber fails completely, fallback to image OCR for all pages
+        pages_text = []
+
+    # If any page is empty -> try OCR for that page using pdf2image
+    need_ocr_idx = [i for i,t in enumerate(pages_text) if t.strip() == ""] if pages_text else None
+
+    if pages_text == []:
+        # do OCR for all pages
+        images = convert_from_bytes(pdf_bytes, dpi=dpi)
+        pages_text = []
+        for img in images:
+            try:
+                txt = pytesseract.image_to_string(img)
+            except Exception:
+                txt = ""
+            pages_text.append(clean_text(txt))
+    elif need_ocr_idx:
+        # render only needed pages to save time
+        images = convert_from_bytes(pdf_bytes, dpi=dpi)
+        for i in need_ocr_idx:
+            try:
+                txt = pytesseract.image_to_string(images[i])
+            except Exception:
+                txt = ""
+            pages_text[i] = clean_text(txt)
+
+    # ensure length equals num pages (if mismatch, pad)
+    return [clean_text(t) for t in pages_text]

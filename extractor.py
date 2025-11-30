@@ -1,94 +1,149 @@
 # extractor.py
-import io
 import re
-from typing import List, Dict
-import logging
+from typing import List, Dict, Tuple
+from decimal import Decimal, InvalidOperation
 
-logger = logging.getLogger("extractor")
-
-# Amount regex: matches 1,234.56 or 1234.56 or 1000
-AMOUNT_RE = re.compile(r'(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:\.\d{1,2})?')
-
-# lines containing these keywords should NOT be considered items
-NON_ITEM_KEYWORDS = re.compile(
-    r'\b(total|subtotal|grand total|net amount|balance due|amount due|gst|cgst|sgst|tax|roundoff|discount)\b',
-    flags=re.I
-)
-
-def _clean_amount_token(tok: str):
-    if tok is None: 
-        return None
-    s = str(tok).replace(",", "").replace(" ", "").strip()
+# helper to parse numeric strings like "1,234.56" -> float
+def parse_number(s: str) -> float:
+    if s is None:
+        return 0.0
+    s = s.replace(',', '').strip()
     try:
-        return float(s)
-    except:
-        return None
+        return float(Decimal(s))
+    except (InvalidOperation, ValueError):
+        # remove non-numeric (except dot)
+        s2 = re.sub(r'[^\d.\-]', '', s)
+        try:
+            return float(Decimal(s2)) if s2 not in ("", ".", "-") else 0.0
+        except Exception:
+            return 0.0
 
-def parse_lines_to_items(lines: List[str]) -> List[Dict]:
-    items = []
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-        # ignore heading-like lines that contain only letters and no numbers
-        if not re.search(r'\d', line):
-            continue
-        # skip very likely non-item lines
-        if NON_ITEM_KEYWORDS.search(line):
-            # still capture totals separately (if needed) in main logic
-            continue
-        # Try structured pattern: name  qty  rate  amount (numbers separated)
-        m = re.match(r'^(?P<name>.+?)\s+(\b(?P<qty>\d+(?:\.\d+)?)\b)\s+(\b(?P<rate>\d{1,3}(?:[,\s]\d{3})(?:\.\d{1,2})?)\b)\s+(\b(?P<amt>\d{1,3}(?:[,\s]\d{3})(?:\.\d{1,2})?)\b)\s*$', line)
+# find candidate grand total by looking for keywords near numbers
+TOTAL_PATTERNS = [
+    r'grand\s*total[:\s]*([0-9,\.]+)',
+    r'net\s*amount\s*payable[:\s]*([0-9,\.]+)',
+    r'net\s*total[:\s]*([0-9,\.]+)',
+    r'balance\s*payable[:\s]*([0-9,\.]+)',
+    r'total\s*amount[:\s]*([0-9,\.]+)',
+    r'total[:\s]*([0-9,\.]{2,})'
+]
+
+def find_grand_total_from_text(text: str) -> float:
+    t = text.lower()
+    for pat in TOTAL_PATTERNS:
+        m = re.search(pat, t)
         if m:
-            name = m.group('name').strip()
-            qty = float(m.group('qty')) if m.group('qty') else 1
-            rate = _clean_amount_token(m.group('rate')) or 0.0
-            amt = _clean_amount_token(m.group('amt')) or (rate * qty)
-            items.append({"item_name": name, "item_amount": round(amt,2), "item_rate": round(rate,2), "item_quantity": int(qty)})
-            continue
+            return parse_number(m.group(1))
+    # fallback: last large number in page as grand total (heuristic)
+    nums = re.findall(r'([0-9][0-9,]*\.\d{2})', text)
+    if nums:
+        # return the largest numeric (likely total)
+        vals = [parse_number(x) for x in nums]
+        return max(vals)
+    return None
 
-        # fallback: find all amount tokens and pick the last as item_amount
-        amounts = AMOUNT_RE.findall(line)
-        if amounts:
-            amt_tok = amounts[-1]
-            amt = _clean_amount_token(amt_tok) or 0.0
-            # name is text before last amount token
-            idx = line.rfind(amt_tok)
-            name = line[:idx].strip(' -:,.') or line
-            # try to see if another numeric token before last could be rate/qty
-            rate = None
-            qty = 1
-            if len(amounts) >= 2:
-                # second last may be rate/qty - we choose not to assume; set rate=None => will be 0
-                second = amounts[-2]
-                # if second numeric appears before amount and separated likely qty or rate; use heuristic
-                # if it's small integer (<=10) treat as qty
-                try:
-                    val = float(second.replace(',','').replace(' ',''))
-                    if val.is_integer() and val <= 100:
-                        qty = int(val)
-                    else:
-                        rate = val
-                except:
-                    rate = None
-            if rate is None:
-                rate_val = 0.0
-            else:
-                rate_val = float(rate)
-            items.append({"item_name": name, "item_amount": round(amt,2), "item_rate": round(rate_val,2) if rate_val else 0.0, "item_quantity": int(qty)})
+def parse_items_from_page_text(page_text: str) -> List[Dict]:
+    """
+    Heuristic parsing:
+    - split lines
+    - for each line: if it contains at least one number -> treat as candidate line-item
+    - map last number as item_amount, second-last as item_rate (if present), third-last as qty
+    - item_name is the left side (text before first numeric group)
+    """
+    items = []
+    lines = page_text.splitlines()
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
             continue
-        # if nothing matched, skip
+        # find numbers with decimals or comma-format
+        nums = re.findall(r'(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d{1,2}|\d+)', ln)
+        if not nums:
+            continue
+        # ignore lines that look like phone numbers or dates? Basic filter: if only one short integer < 4 digits and line length small -> skip
+        # choose last as amount
+        item_amount = parse_number(nums[-1])
+        item_rate = 0.0
+        item_quantity = 1
+        if len(nums) >= 2:
+            # choose second last as rate candidate (but if it's extremely large maybe it's qty; heuristics)
+            item_rate = parse_number(nums[-2])
+        if len(nums) >= 3:
+            item_quantity = parse_number(nums[-3])
+            if item_quantity == 0:
+                item_quantity = 1
+        # item name: part of line before first numeric token
+        first_num = re.search(r'(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d{1,2}|\d+)', ln)
+        if first_num:
+            name = ln[:first_num.start()].strip(' .:-,')
+        else:
+            name = ln
+        name = re.sub(r'\s{2,}', ' ', name)
+        # guard: if name is empty, put whole line but we'll try to clean trailing numbers
+        if not name:
+            # remove numeric tokens from end
+            name = re.sub(r'[-\d,.\s]+$', '', ln).strip()
+        if not name:
+            name = ln  # give something
+
+        items.append({
+            "item_name": name,
+            "item_amount": round(item_amount, 2),
+            "item_rate": round(item_rate, 2) if item_rate else 0.0,
+            "item_quantity": int(item_quantity) if float(item_quantity).is_integer() else item_quantity,
+            "raw": ln
+        })
     return items
 
-def extract_bill_from_text_pages(pages_text: List[str]) -> List[Dict]:
+def find_totals_and_reconcile(page_texts: List[str]) -> Tuple[float, float]:
     """
-    Input: list of page text strings
-    Output: list of pages: {"page_no": n, "page_type": "Bill Detail", "bill_items": [...]}
+    Find grand total across pages (search each page). Compute reconciled amount = grand - sum(extracted).
+    Returns (grand_total_found_or_None, reconciled_amount)
     """
-    results = []
-    for i, text in enumerate(pages_text, start=1):
-        lines = [ln for ln in (text.splitlines() if text else [])]
-        # if PDF's page extraction produced empty lines, try to keep pages empty
-        items = parse_lines_to_items(lines)
-        results.append({"page_no": str(i), "page_type": "Bill Detail", "bill_items": items})
-    return results
+    grand_found = None
+    for p in page_texts:
+        val = find_grand_total_from_text(p)
+        if val:
+            grand_found = val
+            break
+    return grand_found
+
+def run_full_extraction(page_texts: List[str]) -> Dict:
+    pagewise_line_items = []
+    total_extracted = 0.0
+    for idx, ptxt in enumerate(page_texts, start=1):
+        items = parse_items_from_page_text(ptxt)
+        # filter out spurious items where amount is 0 and the raw doesn't look like a product line:
+        filtered = []
+        for it in items:
+            # If amount zero and raw is very short or looks like heading, skip
+            if it['item_amount'] == 0 and len(it['raw']) < 10:
+                continue
+            filtered.append(it)
+        pagewise_line_items.append({
+            "page_no": idx,
+            "page_type": "Bill Detail",
+            "bill_items": filtered
+        })
+        total_extracted += sum(i.get('item_amount', 0.0) for i in filtered)
+
+    grand_found = find_totals_and_reconcile([p['page_type'] + "\n" + ("\n".join(pt for pt in []) for p in [])]) if False else None
+    # simpler: find grand from page_texts using helper
+    grand_found = find_grand_total_from_text("\n".join(page_texts)) or None
+
+    reconciled = None
+    if grand_found is not None:
+        reconciled = round(grand_found - round(total_extracted, 2), 2)
+    else:
+        reconciled = round(0.0 - round(total_extracted, 2), 2)  # if no grand known, negative indicates mismatch
+
+    response = {
+        "is_success": True,
+        "data": {
+            "pagewise_line_items": pagewise_line_items,
+            "total_item_count": sum(len(p["bill_items"]) for p in pagewise_line_items),
+            "reconciled_amount": reconciled,
+            "grand_total_found": grand_found if grand_found is not None else 0.0
+        }
+    }
+    return response
